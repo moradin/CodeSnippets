@@ -1,0 +1,136 @@
+void RendererDX12::TakeScreenshot( IDXGISwapChain* swapChain )
+{
+	if(!_screenshotRequested)
+	{
+		return;
+	}
+
+	_screenshotRequested = false;
+
+	if(swapChain == nullptr || _device.IsNull())
+	{
+		LOG_ERROR("RendererDX12", "Can't take screenshot with null swapchain");
+		_screenshotState = ScreenshotState::ResourceUnavailable;
+		return;
+	}
+
+	_frameIndex = GetCurrentBackBufferIndex(swapChain);
+	ID3D12Resource* backBufferTemp = nullptr;
+	swapChain->GetBuffer(_frameIndex, IID_PPV_ARGS(&backBufferTemp));
+	D3DPtr<ID3D12Resource> backBuffer = backBufferTemp;
+
+	D3D12_RESOURCE_DESC bbDesc = backBuffer->GetDesc();
+	if (bbDesc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+	{
+		LOG_ERROR("RendererDX12", "Can't take screenshot with non 2D backbuffer");
+		_screenshotState = ScreenshotState::ResourceUnavailable;
+		return;
+	}
+
+	if( bbDesc.Format < DXGI_FORMAT_R8G8B8A8_TYPELESS || bbDesc.Format > DXGI_FORMAT_R8G8B8A8_SINT )
+	{
+		LOG_ERROR("RendererDX12", "Can't take screenshot with non 8bit format");
+		_screenshotState = ScreenshotState::ResourceUnavailable;
+		return;
+	}
+
+	if(bbDesc.Layout == D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE || bbDesc.Layout == D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE)
+	{
+		LOG_ERROR("RendererDX12", "Can't take screenshot with swizzled backbuffer");
+		_screenshotState = ScreenshotState::ResourceUnavailable;
+		return;
+	}
+	
+	// create resolve buffer
+	UINT64 bufferSize = GetRequiredIntermediateSize(backBuffer.get(), 0, 1);
+	D3D12_RESOURCE_DESC resolveDesc = CD3DX12_RESOURCE_DESC::Buffer(bufferSize);
+
+	ID3D12Resource* resolveBufferTemp = nullptr;
+	HRESULT res = _device->CreateCommittedResource(
+		&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_READBACK),
+		D3D12_HEAP_FLAG_NONE,
+		&resolveDesc,
+		D3D12_RESOURCE_STATE_COPY_DEST,
+		nullptr,
+		IID_PPV_ARGS(&resolveBufferTemp));
+
+	D3DPtr<ID3D12Resource> resolveBuffer = resolveBufferTemp;
+
+	D3D12_PLACED_SUBRESOURCE_FOOTPRINT resolveFootprint;
+	_device->GetCopyableFootprints(&bbDesc, 0, 1, 0, &resolveFootprint, nullptr, nullptr, nullptr);
+	uint32_t rowPitch = resolveFootprint.Footprint.RowPitch;
+
+	ID3D12Fence* fenceTemp;
+	res = _device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fenceTemp));
+	D3DPtr<ID3D12Fence> fence = fenceTemp;
+
+	HANDLE event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+
+	res = _readBackCommandList->Reset(_screenSpaceCommandAllocator.get(), nullptr);
+
+	CD3DX12_TEXTURE_COPY_LOCATION Dst(resolveBuffer.get(), resolveFootprint);
+	CD3DX12_TEXTURE_COPY_LOCATION Src(backBuffer.get(), 0);
+	_readBackCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(backBuffer.get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE));
+	_readBackCommandList->CopyTextureRegion(&Dst, 0, 0, 0, &Src, nullptr);
+	_readBackCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(backBuffer.get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT));
+	res = _readBackCommandList->Close();
+
+	ID3D12CommandList* _ppTexturedCommandLists[] = { _readBackCommandList.get() };
+	_lastexecutedCommandQueue->ExecuteCommandLists(_countof(_readBackCommandLists), _readBackCommandLists);
+
+	_lastexecutedCommandQueue->Signal(fence.get(), 1);
+	fence->SetEventOnCompletion(1, event);
+	WaitForSingleObject(event, INFINITE);
+
+	void* resolvedData = nullptr;
+	res = resolveBuffer->Map(0, nullptr, &resolvedData);
+	if(FAILED(res))
+	{
+		LOG_ERROR("RendererDX12", "Failed to take screenshot: Failed to map backbuffer");
+		_screenshotState = ScreenshotState::FailedToMapTexture;
+	}
+	else
+	{
+		auto sptr = reinterpret_cast<const uint8_t*>(resolvedData);
+		if(!sptr)
+		{
+			LOG_ERROR("RendererDX12", "Failed to take screenshot: Failed to map texture");
+			_screenshotState = ScreenshotState::FailedToMapTexture;
+		}
+		else
+		{
+			//copy backbuffer data
+			_screenshotData->width = (uint32_t)bbDesc.Width;
+			_screenshotData->height = bbDesc.Height;
+			_screenshotData->buffer.resize(bbDesc.Height * rowPitch);
+			uint8_t* dptr = _screenshotData->buffer.data();
+
+			//we have knowledge about the backbuffer but others might have to change this
+			size_t idealPitch = 4 * (uint32_t)bbDesc.Width;
+
+			if(idealPitch == rowPitch)
+			{
+				uint32_t totalBytes = bbDesc.Height * rowPitch;
+				memcpy_s(dptr, totalBytes, sptr, totalBytes);
+			}
+			else
+			{
+				size_t msize = std::min<size_t>(idealPitch, rowPitch);
+				for(size_t h = 0; h < bbDesc.Height; ++h)
+				{
+					memcpy_s(dptr, msize, sptr, msize);
+					sptr += rowPitch;
+					dptr += idealPitch;
+				}
+			}
+
+			_screenshotState = ScreenshotState::Success;
+		}
+
+		// creating reverse range to specify that the CPU didn't write anything
+		D3D12_RANGE reverseRange = { 1, 0 };
+		resolveBuffer->Unmap(0, &reverseRange);
+	}
+
+	CloseHandle(event);
+}
