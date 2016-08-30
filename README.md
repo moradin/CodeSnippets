@@ -1,1 +1,1 @@
-# DirectX12Snippets
+# Useful code snippets picked up through development
